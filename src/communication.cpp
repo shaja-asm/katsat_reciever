@@ -78,14 +78,28 @@ D2 -> DIO0
 D3 -> DIO1
 */
 
-// Must match transmitter exactly
-static constexpr float    LORA_FREQUENCY_MHZ    = 434.0;
-static constexpr float    LORA_BANDWIDTH_KHZ    = 125.0;
-static constexpr uint8_t  LORA_SPREADING_FACTOR = 12;
-static constexpr uint8_t  LORA_CODING_RATE      = 8;     // 4/8
-static constexpr uint8_t  LORA_SYNC_WORD        = 0x12;
-static constexpr int8_t   LORA_POWER_DBM        = 17;    // not used for RX, but begin() expects it
-static constexpr uint16_t LORA_PREAMBLE_LENGTH  = 12;
+struct LoRaReceiverConfig {
+  float frequencyMHz;
+  float bandwidthkHz;
+  uint8_t spreadingFactor;
+  uint8_t codingRateDenom;
+  uint8_t syncWord;
+  int8_t txPowerdBm;
+  uint16_t preambleLength;
+  uint32_t sendIntervalMs;
+};
+
+// Must match transmitter exactly.
+const LoRaReceiverConfig kReceiverLoRaConfig = {
+    .frequencyMHz = 434.0,
+    .bandwidthkHz = 125.0,
+    .spreadingFactor = 12,
+    .codingRateDenom = 8,
+    .syncWord = 0x12,
+    .txPowerdBm = 17,
+    .preambleLength = 12,
+    .sendIntervalMs = 10000,
+};
 
 SX1278 radio = new Module(PIN_LORA_CS, PIN_LORA_DIO0, PIN_LORA_RST, PIN_LORA_DIO1);
 
@@ -96,6 +110,10 @@ uint32_t okCount = 0;
 uint32_t crcCount = 0;
 uint32_t missedCount = 0;
 uint32_t lastHeartbeat = 0;
+uint32_t lastPacketMillis = 0;
+uint32_t learnedPacketIntervalMs = 0;
+unsigned long lastTxUptimeMs = 0;
+bool overduePacketWarningActive = false;
 
 void setFlag() {
   receivedFlag = true;
@@ -125,25 +143,41 @@ bool restartReceive() {
   return true;
 }
 
+uint32_t expectedPacketIntervalMs() {
+  if (learnedPacketIntervalMs != 0) {
+    return learnedPacketIntervalMs;
+  }
+  return kReceiverLoRaConfig.sendIntervalMs;
+}
+
+uint32_t overduePacketThresholdMs() {
+  // Allow some slack for airtime, scheduler jitter, and clock drift.
+  const uint32_t expectedMs = expectedPacketIntervalMs();
+  const uint32_t slackMs = (expectedMs / 4U > 1500U) ? (expectedMs / 4U) : 1500U;
+  return expectedMs + slackMs;
+}
+
 bool beginRadio() {
   Logger::info("PINS", "Nano -> Ra-02");
   Logger::info("PINS", "D13=SCK, D12=MISO, D11=MOSI, D10=NSS, D9=RST, D2=DIO0, D3=DIO1");
 
-  Logger::info("CFG", "Frequency: %.3f MHz", LORA_FREQUENCY_MHZ);
-  Logger::info("CFG", "Bandwidth: %.1f kHz", LORA_BANDWIDTH_KHZ);
-  Logger::info("CFG", "Spreading Factor: %u", LORA_SPREADING_FACTOR);
-  Logger::info("CFG", "Coding Rate: 4/%u", LORA_CODING_RATE);
-  Logger::info("CFG", "Sync Word: 0x%02X", LORA_SYNC_WORD);
-  Logger::info("CFG", "Preamble Length: %u", LORA_PREAMBLE_LENGTH);
+  Logger::info("CFG", "Frequency: %.3f MHz", kReceiverLoRaConfig.frequencyMHz);
+  Logger::info("CFG", "Bandwidth: %.1f kHz", kReceiverLoRaConfig.bandwidthkHz);
+  Logger::info("CFG", "Spreading Factor: %u", kReceiverLoRaConfig.spreadingFactor);
+  Logger::info("CFG", "Coding Rate: 4/%u", kReceiverLoRaConfig.codingRateDenom);
+  Logger::info("CFG", "Sync Word: 0x%02X", kReceiverLoRaConfig.syncWord);
+  Logger::info("CFG", "Preamble Length: %u", kReceiverLoRaConfig.preambleLength);
+  Logger::info("CFG", "Nominal TX interval: %lu ms",
+               static_cast<unsigned long>(kReceiverLoRaConfig.sendIntervalMs));
 
   const int16_t state = radio.begin(
-      LORA_FREQUENCY_MHZ,
-      LORA_BANDWIDTH_KHZ,
-      LORA_SPREADING_FACTOR,
-      LORA_CODING_RATE,
-      LORA_SYNC_WORD,
-      LORA_POWER_DBM,
-      LORA_PREAMBLE_LENGTH);
+      kReceiverLoRaConfig.frequencyMHz,
+      kReceiverLoRaConfig.bandwidthkHz,
+      kReceiverLoRaConfig.spreadingFactor,
+      kReceiverLoRaConfig.codingRateDenom,
+      kReceiverLoRaConfig.syncWord,
+      kReceiverLoRaConfig.txPowerdBm,
+      kReceiverLoRaConfig.preambleLength);
 
   if (state != RADIOLIB_ERR_NONE) {
     Logger::error("RADIO", "radio.begin() failed | code=%d | %s", state, statusToString(state));
@@ -171,12 +205,34 @@ bool beginRadio() {
 }
 
 void logHeartbeat() {
-  if (millis() - lastHeartbeat >= 30000) {
+  if (millis() - lastHeartbeat >= expectedPacketIntervalMs()) {
     Logger::info("HEARTBEAT", "alive, waiting for packets... ok=%lu missed=%lu crc=%lu",
                  static_cast<unsigned long>(okCount),
                  static_cast<unsigned long>(missedCount),
                  static_cast<unsigned long>(crcCount));
     lastHeartbeat = millis();
+  }
+}
+
+void checkForOverduePacket() {
+  if (lastPacketMillis == 0) {
+    return;
+  }
+
+  const uint32_t elapsedMs = millis() - lastPacketMillis;
+  if (elapsedMs < overduePacketThresholdMs()) {
+    if (overduePacketWarningActive) {
+      Logger::info("RX", "Packet cadence back to normal");
+      overduePacketWarningActive = false;
+    }
+    return;
+  }
+
+  if (!overduePacketWarningActive) {
+    Logger::warn("RX", "No packet for %lu ms, expected one every %lu ms",
+                 static_cast<unsigned long>(elapsedMs),
+                 static_cast<unsigned long>(expectedPacketIntervalMs()));
+    overduePacketWarningActive = true;
   }
 }
 
@@ -192,6 +248,7 @@ void handlePacket() {
 
   if (state == RADIOLIB_ERR_NONE) {
     okCount++;
+    const uint32_t now = millis();
 
     Logger::info("RX", "Packet received");
     Logger::info("RX", "Payload: %s", payload.c_str());
@@ -205,6 +262,14 @@ void handlePacket() {
       Logger::warn("RX", "Large frequency offset detected: %.2f Hz", feiHz);
     }
 
+    if (lastPacketMillis != 0) {
+      const uint32_t packetGapMs = now - lastPacketMillis;
+      Logger::info("RX", "Packet gap: %lu ms", static_cast<unsigned long>(packetGapMs));
+    }
+
+    lastPacketMillis = now;
+    overduePacketWarningActive = false;
+
     unsigned long seq = 0;
     unsigned long uptimeMs = 0;
     char msg[40] = {0};
@@ -217,6 +282,11 @@ void handlePacket() {
         msg);
 
     if (parsed == 3) {
+      if (lastTxUptimeMs != 0 && uptimeMs > lastTxUptimeMs) {
+        learnedPacketIntervalMs = static_cast<uint32_t>(uptimeMs - lastTxUptimeMs);
+      }
+      lastTxUptimeMs = uptimeMs;
+
       if (lastSeq >= 0 && seq > static_cast<unsigned long>(lastSeq + 1)) {
         const unsigned long missed = seq - static_cast<unsigned long>(lastSeq + 1);
         missedCount += missed;
@@ -261,6 +331,7 @@ bool begin(unsigned long serialBaud) {
 
 void update() {
   logHeartbeat();
+  checkForOverduePacket();
   handlePacket();
   delay(2);
 }
